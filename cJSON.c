@@ -259,6 +259,28 @@ cJSON *cJSON_Parse(const char *value)
 	return c;
 }
 
+cJSON *cJSON_ParseFile(const char* filename)
+{
+  cJSON *cJSON;
+  FILE *fp;
+  long len;
+  char *buf;
+  fp = fopen(filename, "rb");
+  if (fp) {
+    fseek(fp,0,SEEK_END); //go to end
+    len=ftell(fp); //get position at end (length)
+    fseek(fp,0,SEEK_SET); //go to beg.
+    buf=(char *)malloc(len); //malloc buffer
+    fread(buf,len,1,fp); //read into buffer
+    fclose(fp);
+    cJSON = cJSON_Parse(buf);
+    free(buf);
+    return cJSON;
+  }
+
+  return NULL;
+}
+
 /* Render a cJSON item/entity/structure to text. */
 char *cJSON_Print(cJSON *item)				{return print_value(item,0,1);}
 char *cJSON_PrintUnformatted(cJSON *item)	{return print_value(item,0,0);}
