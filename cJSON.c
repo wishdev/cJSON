@@ -1,5 +1,6 @@
 /*
   Copyright (c) 2009 Dave Gamble
+  Copyright (c) 2011 Jonathan Reams
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -36,12 +37,16 @@ static const char *ep;
 
 const char *cJSON_GetErrorPtr() {return ep;}
 
+#ifndef HAVE_STRCASECMP
 static int cJSON_strcasecmp(const char *s1,const char *s2)
 {
 	if (!s1) return (s1==s2)?0:1;if (!s2) return 1;
 	for(; tolower(*s1) == tolower(*s2); ++s1, ++s2)	if(*s1 == 0)	return 0;
 	return tolower(*(const unsigned char *)s1) - tolower(*(const unsigned char *)s2);
 }
+#else
+#define cJSON_strcasecmp(a, b) strcasecmp(a, b)
+#endif
 
 static void *(*cJSON_malloc)(size_t sz) = malloc;
 static void (*cJSON_free)(void *ptr) = free;
@@ -69,6 +74,325 @@ void cJSON_InitHooks(cJSON_Hooks* hooks)
 	cJSON_free	 = (hooks->free_fn)?hooks->free_fn:free;
 }
 
+/* Objects and Arrays are implemented as red-black trees.
+   These routines implement a generic red-black tree. */
+inline void set_parent(cJSON * parent, cJSON * node) {
+	node->parent = parent;
+}
+inline void set_child(cJSON * child, cJSON * node, int isleft) {
+	if(isleft)
+		node->left = child;
+	else
+		node->right = child;
+}
+inline cJSON * child_first(cJSON * node) {
+	while(node->left)
+		node = node->left;
+	return node;
+}
+inline cJSON * child_last(cJSON * node) {
+	while(node->right)
+		node = node->right;
+	return node;
+}
+inline cJSON * obj_first(cJSON * obj) {
+	if(obj->type != cJSON_Object && obj->type != cJSON_Array)
+		return NULL;
+	return obj->first;
+}
+inline cJSON * obj_last(cJSON * obj) {
+	if(obj->type != cJSON_Object && obj->type != cJSON_Array)
+		return NULL;
+	return obj->last;
+}
+inline cJSON * child_next(cJSON * node) {
+	cJSON * parent;
+	if(node->right)
+		return child_first(node->right);
+	while((parent = node->parent) && parent->right == node)
+		node = parent;
+	return parent;
+}
+inline cJSON * child_prev(cJSON * node) {
+	cJSON * parent;
+	if(node->left)
+		return child_last(node->left);
+	while((parent = node->parent) && parent->left == node)
+		node = parent;
+	return parent;
+}
+
+inline cJSON * tree_lookup(const char * key, int index,
+	cJSON * tree, cJSON ** parent, int *isleft) {
+	if(tree->type != cJSON_Object && tree->type != cJSON_Array)
+		return NULL;
+	cJSON * object = tree->root;
+	if(parent)
+		*parent = NULL;
+	if(isleft)
+		*isleft = 0;
+	while(object) {
+		int res = 0;
+		if(tree->type == cJSON_Object)
+			res = cJSON_strcasecmp(key, object->string);
+		else if(object->index > index)
+			res = 1;
+		else if(object->index < index)
+			res = -1;
+		if(res == 0)
+			return object;
+		if(parent)
+			*parent = object;
+		if(res > 0) {
+			if(isleft)
+				*isleft = 1;
+			object = object->left;
+		} else {
+			if(isleft)
+				*isleft = 0;
+			object = object->right;
+		}
+	}
+	return NULL;
+}
+
+void tree_rotate_left(cJSON * node, cJSON * tree) {
+	cJSON * p = node;
+	cJSON * q = node->right;
+	cJSON * parent = p->parent;
+	if(parent != NULL) {
+		if(parent->left == p)
+			parent->left = q;
+		else
+			parent->right = q;
+	} else
+		tree->root = q;
+	set_parent(parent, q);
+	set_parent(q, p);
+
+	p->right = q->left;
+	if(p->right)
+		set_parent(p, p->right);
+	q->left = p;
+}
+
+void tree_rotate_right(cJSON * node, cJSON * tree) {
+	cJSON * p = node;
+	cJSON * q = node->left;
+	cJSON * parent = p->parent;
+
+	if(parent != NULL) {
+		if(parent->left == p)
+			parent->left = q;
+		else
+			parent->right = q;
+	} else
+		tree->root = q;
+	set_parent(parent, q);
+	set_parent(q, p);
+
+	p->left = q->right;
+	if(p->left)
+		set_parent(p, p->left);
+	q->right = p;
+}
+
+cJSON * tree_insert_item(cJSON * node, cJSON * tree) {
+	cJSON *item, *parent;
+	int isleft;
+	if(tree->type != cJSON_Object && tree->type != cJSON_Array)
+		return NULL;
+
+	item = tree_lookup(node->string, node->index,
+		tree, &parent, &isleft);
+	if(item)
+		return item;
+
+	node->left = NULL;
+	node->right = NULL;
+	node->isred = 1;
+	set_parent(parent, node);
+
+	if(parent) {
+		if(isleft && parent == tree->first)
+			tree->first = node;
+		else if(parent == tree->last)
+			tree->last = node;
+		set_child(node, parent, isleft);
+	} else {
+		tree->root = node;
+		tree->first = node;
+		tree->last = node;
+	}
+
+	while((parent = node->parent) && parent->isred & 1) {
+		cJSON * grandpa = parent->parent;
+		if(parent == grandpa->left) {
+			cJSON * uncle = grandpa->right;
+
+			if(uncle && uncle->isred & 1) {
+				parent->isred = 0;
+				uncle->isred = 0;
+				grandpa->isred = 1;
+				node = grandpa;
+			} else {
+				if(node == parent->right) {
+					tree_rotate_left(parent, tree);
+					node = parent;
+					parent = node->parent;
+				}
+				parent->isred = 0;
+				grandpa->isred = 1;
+				tree_rotate_right(grandpa, tree);
+			}
+		} else {
+			cJSON * uncle = grandpa->left;
+
+			if(uncle && uncle->isred & 1) {
+				parent->isred = 0;
+				uncle->isred = 0;
+				grandpa->isred = 1;
+				node = grandpa;
+			} else {
+				if(node == parent->left) {
+					tree_rotate_right(parent, tree);
+					node = parent;
+					parent = node->parent;
+				}
+				parent->isred = 0;
+				grandpa->isred = 1;
+				tree_rotate_left(grandpa, tree);
+			}
+		}
+	}
+	tree->root->isred = 0;
+	return NULL;
+}
+
+void tree_remove(cJSON * node, cJSON * tree) {
+	if(tree->type != cJSON_Object && tree->type != cJSON_Array)
+		return ;
+	cJSON * parent = node->parent;
+	cJSON * left = node->left;
+	cJSON * right = node->right;
+	cJSON * next;
+	int color;
+
+	if(node == tree->first)
+		tree->first = child_next(node);
+	if(node == tree->last)
+		tree->last = child_next(node);
+
+	if(!left)
+		next = right;
+	else if(!right)
+		next = left;
+	else
+		next = child_first(right);
+
+	if(parent)
+		set_child(next, parent, parent->left == node);
+	else
+		tree->root = next;
+
+	if(left && right) {
+		color = next->isred;
+		next->isred = node->isred;
+		next->left = left;
+		set_parent(next, left);
+
+		if(next != right) {
+			parent = next->parent;
+			set_parent(node->parent, next);
+
+			node = next->right;
+			parent->left = node;
+
+			next->right = right;
+			set_parent(next, right);
+		} else {
+			set_parent(parent, next);
+			parent = next;
+			node = next->right;
+		}
+	} else {
+		color = node->isred;
+		node = next;
+	}
+
+	if(node)
+		set_parent(parent, node);
+
+	if(color & 1)
+		return;
+	if(node && node->isred & 1) {
+		node->isred = 0;
+		return;
+	}
+
+	do {
+		if(node == tree->root)
+			break;
+		if(node == parent->left) {
+			cJSON * sibling = parent->right;
+			if(sibling->isred & 1) {
+				sibling->isred = 0;
+				parent->isred = 1;
+				tree_rotate_left(parent, tree);
+				sibling = parent->right;
+			}
+			if((!sibling->left || sibling->left->isred == 0) &&
+				(!sibling->right || sibling->right->isred == 0)) {
+				sibling->isred = 1;
+				node = parent;
+				parent = parent->parent;
+				continue;
+			}
+			if(!sibling->right || sibling->right->isred == 0) {
+				sibling->left->isred = 0;
+				sibling->isred = 1;
+				tree_rotate_right(sibling, tree);
+				sibling = parent->right;
+			}
+			sibling->isred = parent->isred;
+			parent->isred = 0;
+			sibling->right->isred = 0;
+			tree_rotate_left(parent, tree);
+			node = tree->root;
+			break;
+		} else {
+			cJSON * sibling = parent->right;
+			if(sibling->isred & 1) {
+				sibling->isred = 0;
+				parent->isred = 1;
+				tree_rotate_right(parent, tree);
+				sibling = parent->left;
+			}
+			if((!sibling->left || sibling->left->isred == 0) &&
+				(!sibling->right || sibling->right->isred == 0)) {
+				sibling->isred = 1;
+				node = parent;
+				parent = parent->parent;
+				continue;
+			}
+			if(!sibling->left || sibling->left->isred == 0) {
+				sibling->right->isred = 0;
+				sibling->isred = 1;
+				tree_rotate_left(sibling, tree);
+				sibling = parent->left;
+			}
+			sibling->isred = parent->isred;
+			parent->isred = 0;
+			sibling->left->isred = 0;
+			tree_rotate_right(parent, tree);
+			node = tree->root;
+			break;
+		}
+	} while(node->isred == 0);
+	if(node)
+		node->isred = 0;
+}
+
 /* Internal constructor. */
 static cJSON *cJSON_New_Item()
 {
@@ -80,16 +404,17 @@ static cJSON *cJSON_New_Item()
 /* Delete a cJSON structure. */
 void cJSON_Delete(cJSON *c)
 {
-	cJSON *next;
-	while (c)
-	{
-		next=c->next;
-		if (!(c->type&cJSON_IsReference) && c->child) cJSON_Delete(c->child);
-		if (!(c->type&cJSON_IsReference) && c->valuestring) cJSON_free(c->valuestring);
-		if (c->string) cJSON_free(c->string);
-		cJSON_free(c);
-		c=next;
-	}
+	if(c->root)
+		cJSON_Delete(c->root);
+	if(c->left)
+		cJSON_Delete(c->left);
+	if(c->right)
+		cJSON_Delete(c->right);
+	if(c->string)
+		cJSON_free(c->string);
+	if(!(c->type&cJSON_IsReference) && c->valuestring)
+		cJSON_free(c->valuestring);
+	cJSON_free(c);
 }
 
 /* Parse the input text to generate a number, and populate the result into item. */
@@ -116,25 +441,31 @@ static const char *parse_number(cJSON *item,const char *num)
 }
 
 /* Render the number nicely from the given item into a string. */
-static char *print_number(cJSON *item)
+static char *print_number(cJSON *item, size_t * outlen)
 {
 	char *str;
 	double d=item->valuedouble;
+	size_t len;
 	if (fabs(((double)item->valueint)-d)<=DBL_EPSILON && d<=INT_MAX && d>=INT_MIN)
 	{
 		str=(char*)cJSON_malloc(21);	/* 2^64+1 can be represented in 21 chars. */
-		if (str) sprintf(str,"%d",item->valueint);
+		if (str) len =sprintf(str,"%d",item->valueint);
 	}
 	else
 	{
 		str=(char*)cJSON_malloc(64);	/* This is a nice tradeoff. */
 		if (str)
 		{
-			if (fabs(floor(d)-d)<=DBL_EPSILON)			sprintf(str,"%.0f",d);
-			else if (fabs(d)<1.0e-6 || fabs(d)>1.0e9)	sprintf(str,"%e",d);
-			else										sprintf(str,"%f",d);
+			if (fabs(floor(d)-d)<=DBL_EPSILON)
+				len = sprintf(str,"%.0f",d);
+			else if (fabs(d)<1.0e-6 || fabs(d)>1.0e9)
+				len = sprintf(str,"%e",d);
+			else
+				len =sprintf(str,"%f",d);
 		}
 	}
+	if(outlen)
+		*outlen += len;
 	return str;
 }
 
@@ -142,7 +473,10 @@ static char *print_number(cJSON *item)
 static const unsigned char firstByteMark[7] = { 0x00, 0x00, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC };
 static const char *parse_string(cJSON *item,const char *str)
 {
-	const char *ptr=str+1;char *ptr2;char *out;int len=0;unsigned uc,uc2;
+	const char *ptr=str+1;
+	char *ptr2, *out;
+	int len=0;
+	unsigned uc,uc2;
 	if (*str!='\"') {ep=str;return 0;}	/* not a string! */
 	
 	while (*ptr!='\"' && *ptr && ++len) if (*ptr++ == '\\') ptr++;	/* Skip escaped quotes. */
@@ -195,12 +529,13 @@ static const char *parse_string(cJSON *item,const char *str)
 	*ptr2=0;
 	if (*ptr=='\"') ptr++;
 	item->valuestring=out;
+	item->vstrlen = ptr2 - out;
 	item->type=cJSON_String;
 	return ptr;
 }
 
 /* Render the cstring provided to an escaped version that can be printed. */
-static char *print_string_ptr(const char *str)
+static char *print_string_ptr(const char *str, size_t * outlen)
 {
 	const char *ptr;char *ptr2,*out;int len=0;unsigned char token;
 	
@@ -232,18 +567,20 @@ static char *print_string_ptr(const char *str)
 		}
 	}
 	*ptr2++='\"';*ptr2++=0;
+	if(outlen)
+		*outlen += len + 3;
 	return out;
 }
 /* Invote print_string_ptr (which is useful) on an item. */
-static char *print_string(cJSON *item)	{return print_string_ptr(item->valuestring);}
+static char *print_string(cJSON *item, size_t *outlen)	{return print_string_ptr(item->valuestring, outlen);}
 
 /* Predeclare these prototypes. */
 static const char *parse_value(cJSON *item,const char *value);
-static char *print_value(cJSON *item,int depth,int fmt);
+static char *print_value(cJSON *item,int depth,int fmt, size_t *outlen);
 static const char *parse_array(cJSON *item,const char *value);
-static char *print_array(cJSON *item,int depth,int fmt);
+static char *print_array(cJSON *item,int depth,int fmt, size_t *outlen);
 static const char *parse_object(cJSON *item,const char *value);
-static char *print_object(cJSON *item,int depth,int fmt);
+static char *print_object(cJSON *item,int depth,int fmt, size_t * outlen);
 
 /* Utility to jump whitespace and cr/lf */
 static const char *skip(const char *in) {while (in && *in && (unsigned char)*in<=32) in++; return in;}
@@ -282,13 +619,13 @@ cJSON *cJSON_ParseFile(const char* filename)
 }
 
 /* Render a cJSON item/entity/structure to text. */
-char *cJSON_Print(cJSON *item)				{return print_value(item,0,1);}
-char *cJSON_PrintUnformatted(cJSON *item)	{return print_value(item,0,0);}
+char *cJSON_Print(cJSON *item)				{return print_value(item,0,1,NULL);}
+char *cJSON_PrintUnformatted(cJSON *item)	{return print_value(item,0,0,NULL);}
 
 /* Parser core - when encountering text, process appropriately. */
 static const char *parse_value(cJSON *item,const char *value)
 {
-	if (!value)						return 0;	/* Fail on null. */
+	if (value == NULL)				return 0;	/* Fail on null. */
 	if (!strncmp(value,"null",4))	{ item->type=cJSON_NULL;  return value+4; }
 	if (!strncmp(value,"false",5))	{ item->type=cJSON_False; return value+5; }
 	if (!strncmp(value,"true",4))	{ item->type=cJSON_True; item->valueint=1;	return value+4; }
@@ -297,23 +634,36 @@ static const char *parse_value(cJSON *item,const char *value)
 	if (*value=='[')				{ return parse_array(item,value); }
 	if (*value=='{')				{ return parse_object(item,value); }
 
-	ep=value;return 0;	/* failure. */
+	ep=value;
+	return NULL;	/* failure. */
 }
 
 /* Render a value to text. */
-static char *print_value(cJSON *item,int depth,int fmt)
+static char *print_value(cJSON *item,int depth,int fmt, size_t *outlen)
 {
 	char *out=0;
 	if (!item) return 0;
 	switch ((item->type)&255)
 	{
-		case cJSON_NULL:	out=cJSON_strdup("null");	break;
-		case cJSON_False:	out=cJSON_strdup("false");break;
-		case cJSON_True:	out=cJSON_strdup("true"); break;
-		case cJSON_Number:	out=print_number(item);break;
-		case cJSON_String:	out=print_string(item);break;
-		case cJSON_Array:	out=print_array(item,depth,fmt);break;
-		case cJSON_Object:	out=print_object(item,depth,fmt);break;
+		case cJSON_NULL:
+			out=cJSON_strdup("null"); 
+			if(outlen)
+				*outlen +=5;
+			break;
+		case cJSON_False:
+			out=cJSON_strdup("false");
+			if(outlen)
+				*outlen += 6;
+			break;
+		case cJSON_True:
+			out=cJSON_strdup("true");
+			if(outlen)
+				*outlen += 5;
+			break;
+		case cJSON_Number:	out=print_number(item, outlen);break;
+		case cJSON_String:	out=print_string(item, outlen);break;
+		case cJSON_Array:	out=print_array(item,depth,fmt, outlen);break;
+		case cJSON_Object:	out=print_object(item,depth,fmt, outlen);break;
 	}
 	return out;
 }
@@ -321,64 +671,64 @@ static char *print_value(cJSON *item,int depth,int fmt)
 /* Build an array from input text. */
 static const char *parse_array(cJSON *item,const char *value)
 {
-	cJSON *child;
 	if (*value!='[')	{ep=value;return 0;}	/* not an array! */
 
 	item->type=cJSON_Array;
 	value=skip(value+1);
 	if (*value==']') return value+1;	/* empty array. */
 
-	item->child=child=cJSON_New_Item();
-	if (!item->child) return 0;		 /* memory fail */
-	value=skip(parse_value(child,skip(value)));	/* skip any spacing, get the value. */
-	if (!value) return 0;
-
-	while (*value==',')
-	{
-		cJSON *new_item;
-		if (!(new_item=cJSON_New_Item())) return 0; 	/* memory fail */
-		child->next=new_item;new_item->prev=child;child=new_item;
-		value=skip(parse_value(child,skip(value+1)));
-		if (!value) return 0;	/* memory fail */
-	}
-
-	if (*value==']') return value+1;	/* end of array */
-	ep=value;return 0;	/* malformed. */
+	do {
+		cJSON * child = cJSON_New_Item();
+		if(!child)
+			return NULL;
+		if(*value == ',')
+			value++;
+		value = skip(parse_value(child, skip(value)));
+		if(!value)
+			return NULL;
+		child->index = item->count++;
+		tree_insert_item(child, item);
+	} while(value && *value==',');
+	if(*value == ']')
+		return value + 1;
+	ep = value;
+	return NULL;
 }
 
 /* Render an array to text */
-static char *print_array(cJSON *item,int depth,int fmt)
+static char *print_array(cJSON *item,int depth,int fmt, size_t *outlen)
 {
 	char **entries;
-	char *out=0,*ptr,*ret;int len=5;
-	cJSON *child=item->child;
-	int numentries=0,i=0,fail=0;
+	char *out=0,*ptr,*ret;
+	cJSON * child = obj_first(item);
+	int i=0,fail=0;
+	size_t locallen = 5;
 	
-	/* How many entries in the array? */
-	while (child) numentries++,child=child->next;
 	/* Allocate an array to hold the values for each */
-	entries=(char**)cJSON_malloc(numentries*sizeof(char*));
+	entries=(char**)cJSON_malloc(item->count*sizeof(char*));
 	if (!entries) return 0;
-	memset(entries,0,numentries*sizeof(char*));
 	/* Retrieve all the results: */
-	child=item->child;
 	while (child && !fail)
 	{
-		ret=print_value(child,depth+1,fmt);
+		ret=print_value(child,depth+1,fmt, &locallen);
 		entries[i++]=ret;
-		if (ret) len+=strlen(ret)+2+(fmt?1:0); else fail=1;
-		child=child->next;
+		if (ret) locallen+=2+(fmt?1:0);
+		else fail=1;
+		child = child_next(child);
 	}
 	
 	/* If we didn't fail, try to malloc the output string */
-	if (!fail) out=(char*)cJSON_malloc(len);
+	if (!fail) out=(char*)cJSON_malloc(locallen);
 	/* If that fails, we fail. */
 	if (!out) fail=1;
 
 	/* Handle failure. */
 	if (fail)
 	{
-		for (i=0;i<numentries;i++) if (entries[i]) cJSON_free(entries[i]);
+		for (i=0;i<item->count;i++) {
+			if (entries[i])
+				cJSON_free(entries[i]);
+		}
 		cJSON_free(entries);
 		return 0;
 	}
@@ -386,78 +736,89 @@ static char *print_array(cJSON *item,int depth,int fmt)
 	/* Compose the output array. */
 	*out='[';
 	ptr=out+1;*ptr=0;
-	for (i=0;i<numentries;i++)
+	for (i=0;i<item->count;i++)
 	{
 		strcpy(ptr,entries[i]);ptr+=strlen(entries[i]);
-		if (i!=numentries-1) {*ptr++=',';if(fmt)*ptr++=' ';*ptr=0;}
+		if (i!=item->count-1) {
+			*ptr++=',';
+			if(fmt) *ptr++=' ';
+			*ptr=0;
+		}
 		cJSON_free(entries[i]);
 	}
 	cJSON_free(entries);
 	*ptr++=']';*ptr++=0;
+	if(outlen)
+		*outlen += locallen;
 	return out;	
 }
 
 /* Build an object from the text. */
 static const char *parse_object(cJSON *item,const char *value)
 {
-	cJSON *child;
+	cJSON * child;
 	if (*value!='{')	{ep=value;return 0;}	/* not an object! */
 	
 	item->type=cJSON_Object;
 	value=skip(value+1);
-	if (*value=='}') return value+1;	/* empty array. */
+	if (*value=='}') return value+1;	/* empty object. */
 	
-	item->child=child=cJSON_New_Item();
-	if (!item->child) return 0;
-	value=skip(parse_string(child,skip(value)));
-	if (!value) return 0;
-	child->string=child->valuestring;child->valuestring=0;
-	if (*value!=':') {ep=value;return 0;}	/* fail! */
-	value=skip(parse_value(child,skip(value+1)));	/* skip any spacing, get the value. */
-	if (!value) return 0;
-	
-	while (*value==',')
-	{
-		cJSON *new_item;
-		if (!(new_item=cJSON_New_Item()))	return 0; /* memory fail */
-		child->next=new_item;new_item->prev=child;child=new_item;
-		value=skip(parse_string(child,skip(value+1)));
-		if (!value) return 0;
-		child->string=child->valuestring;child->valuestring=0;
-		if (*value!=':') {ep=value;return 0;}	/* fail! */
-		value=skip(parse_value(child,skip(value+1)));	/* skip any spacing, get the value. */
-		if (!value) return 0;
-	}
+	do {
+		child = cJSON_New_Item();
+		if(!child)
+			return NULL;
+		if(*value == ',')
+			value++;
+		value = skip(parse_string(child, skip(value)));
+		if(!value)
+			return NULL;
+		child->string = child->valuestring;
+		if(*value != ':') {
+			ep = value;
+			return NULL;
+		}
+		value = skip(parse_value(child,skip(value + 1)));
+		if(!value)
+			return NULL;
+		if(child->type != cJSON_String)
+			child->valuestring = NULL;
+		tree_insert_item(child, item);
+		item->count++;
+	} while(value && *value==',');
 	
 	if (*value=='}') return value+1;	/* end of array */
-	ep=value;return 0;	/* malformed. */
+	ep=value;return NULL;	/* malformed. */
 }
 
 /* Render an object to text. */
-static char *print_object(cJSON *item,int depth,int fmt)
+static char *print_object(cJSON *item,int depth,int fmt, size_t *outlen)
 {
-	char **entries=0,**names=0;
-	char *out=0,*ptr,*ret,*str;int len=7,i=0,j;
-	cJSON *child=item->child;
-	int numentries=0,fail=0;
-	/* Count the number of entries. */
-	while (child) numentries++,child=child->next;
+	char **entries=NULL,**names=NULL;
+	char *out=NULL,*ptr,*ret,*str;
+	size_t len=7;
+	int i=0,j,fail=0;
+	cJSON *child = obj_first(item);
 	/* Allocate space for the names and the objects */
-	entries=(char**)cJSON_malloc(numentries*sizeof(char*));
-	if (!entries) return 0;
-	names=(char**)cJSON_malloc(numentries*sizeof(char*));
-	if (!names) {cJSON_free(entries);return 0;}
-	memset(entries,0,sizeof(char*)*numentries);
-	memset(names,0,sizeof(char*)*numentries);
+	entries = (char**)cJSON_malloc(item->count*sizeof(char*));
+	if (!entries)
+		return NULL;
+	names = (char**)cJSON_malloc(item->count*sizeof(char*));
+	if (!names) {
+		cJSON_free(entries);
+		return NULL;
+	}
 
 	/* Collect all the results into our arrays: */
-	child=item->child;depth++;if (fmt) len+=depth;
-	while (child)
+	depth++;
+	if(fmt)
+		len+=depth;
+	while(child)
 	{
-		names[i]=str=print_string_ptr(child->string);
-		entries[i++]=ret=print_value(child,depth,fmt);
-		if (str && ret) len+=strlen(ret)+strlen(str)+2+(fmt?2+depth:0); else fail=1;
-		child=child->next;
+		names[i]=str=print_string_ptr(child->string, &len);
+		entries[i++]=ret=print_value(child,depth,fmt, &len);
+		if (str && ret) len+=2+(fmt?2+depth:0);
+		else fail=1;
+		child= child_next(child);
 	}
 	
 	/* Try to allocate the output string */
@@ -467,58 +828,161 @@ static char *print_object(cJSON *item,int depth,int fmt)
 	/* Handle failure */
 	if (fail)
 	{
-		for (i=0;i<numentries;i++) {if (names[i]) cJSON_free(names[i]);if (entries[i]) cJSON_free(entries[i]);}
-		cJSON_free(names);cJSON_free(entries);
-		return 0;
+		for (i=0;i<item->count;i++) {
+			if (names[i]) cJSON_free(names[i]);
+			if (entries[i]) cJSON_free(entries[i]);
+		}
+		cJSON_free(names);
+		cJSON_free(entries);
+		return NULL;
 	}
 	
 	/* Compose the output: */
-	*out='{';ptr=out+1;if (fmt)*ptr++='\n';*ptr=0;
-	for (i=0;i<numentries;i++)
+	*out='{';
+	ptr=out+1;
+	if (fmt)*ptr++='\n';
+	for (i=0;i<item->count;i++)
 	{
-		if (fmt) for (j=0;j<depth;j++) *ptr++='\t';
-		strcpy(ptr,names[i]);ptr+=strlen(names[i]);
-		*ptr++=':';if (fmt) *ptr++='\t';
-		strcpy(ptr,entries[i]);ptr+=strlen(entries[i]);
-		if (i!=numentries-1) *ptr++=',';
-		if (fmt) *ptr++='\n';*ptr=0;
-		cJSON_free(names[i]);cJSON_free(entries[i]);
+		if (fmt) {
+			for (j=0;j<depth;j++) 
+				*ptr++='\t';
+		}
+		strcpy(ptr,names[i]);
+		ptr+=strlen(names[i]);
+		*ptr++=':';
+		if (fmt) *ptr++='\t';
+		strcpy(ptr,entries[i]);
+		ptr+=strlen(entries[i]);
+		if (i!=item->count - 1) *ptr++=',';
+		if (fmt) *ptr++='\n';
+		cJSON_free(names[i]);
+		cJSON_free(entries[i]);
 	}
 	
-	cJSON_free(names);cJSON_free(entries);
-	if (fmt) for (i=0;i<depth-1;i++) *ptr++='\t';
-	*ptr++='}';*ptr++=0;
+	cJSON_free(names);
+	cJSON_free(entries);
+	if (fmt) {
+		for (i=0;i<depth-1;i++)
+			*ptr++='\t';
+	}
+	*ptr++='}';
+	*ptr++=0;
+	if(outlen)
+		*outlen += len;
 	return out;	
 }
 
 /* Get Array size/item / object item. */
-int    cJSON_GetArraySize(cJSON *array)							{cJSON *c=array->child;int i=0;while(c)i++,c=c->next;return i;}
-cJSON *cJSON_GetArrayItem(cJSON *array,int item)				{cJSON *c=array->child;  while (c && item>0) item--,c=c->next; return c;}
-cJSON *cJSON_GetObjectItem(cJSON *object,const char *string)	{cJSON *c=object->child; while (c && cJSON_strcasecmp(c->string,string)) c=c->next; return c;}
+int cJSON_GetArraySize(cJSON *array) {
+	return array->count;
+}
 
-/* Utility for array list handling. */
-static void suffix_object(cJSON *prev,cJSON *item) {prev->next=item;item->prev=prev;}
+cJSON *cJSON_GetArrayItem(cJSON *array,int item) {
+	return tree_lookup(NULL, item, array, NULL, NULL);
+}
+
+cJSON *cJSON_GetObjectItem(cJSON *object,const char *string) {
+	return tree_lookup(string, 0, object, NULL, NULL);
+}
+
+cJSON *cJSON_GetFirstChild(cJSON *object) {
+	return obj_first(object);
+}
+cJSON *cJSON_GetNextChild(cJSON *object) {
+	return child_next(object);
+}
+
+
 /* Utility for handling references. */
-static cJSON *create_reference(cJSON *item) {cJSON *ref=cJSON_New_Item();if (!ref) return 0;memcpy(ref,item,sizeof(cJSON));ref->string=0;ref->type|=cJSON_IsReference;ref->next=ref->prev=0;return ref;}
+static cJSON *create_reference(cJSON *item) {
+	cJSON *ref=cJSON_New_Item();
+	if (!ref) return NULL;
+	memcpy(ref,item,sizeof(cJSON));
+	ref->string=NULL;
+	ref->type|=cJSON_IsReference;
+	return ref;
+}
 
 /* Add item to array/object. */
-void   cJSON_AddItemToArray(cJSON *array, cJSON *item)						{cJSON *c=array->child;if (!item) return; if (!c) {array->child=item;} else {while (c && c->next) c=c->next; suffix_object(c,item);}}
-void   cJSON_AddItemToObject(cJSON *object,const char *string,cJSON *item)	{if (!item) return; if (item->string) cJSON_free(item->string);item->string=cJSON_strdup(string);cJSON_AddItemToArray(object,item);}
-void	cJSON_AddItemReferenceToArray(cJSON *array, cJSON *item)						{cJSON_AddItemToArray(array,create_reference(item));}
-void	cJSON_AddItemReferenceToObject(cJSON *object,const char *string,cJSON *item)	{cJSON_AddItemToObject(object,string,create_reference(item));}
+void cJSON_AddItemToArray(cJSON * array, cJSON * item) {
+	if(array->type != cJSON_Array)
+		return;
+	if(!item)
+		return;
+	item->index = array->count++;
+	tree_insert_item(item, array);
+}
 
-cJSON *cJSON_DetachItemFromArray(cJSON *array,int which)			{cJSON *c=array->child;while (c && which>0) c=c->next,which--;if (!c) return 0;
-	if (c->prev) c->prev->next=c->next;if (c->next) c->next->prev=c->prev;if (c==array->child) array->child=c->next;c->prev=c->next=0;return c;}
-void   cJSON_DeleteItemFromArray(cJSON *array,int which)			{cJSON_Delete(cJSON_DetachItemFromArray(array,which));}
-cJSON *cJSON_DetachItemFromObject(cJSON *object,const char *string) {int i=0;cJSON *c=object->child;while (c && cJSON_strcasecmp(c->string,string)) i++,c=c->next;if (c) return cJSON_DetachItemFromArray(object,i);return 0;}
-void   cJSON_DeleteItemFromObject(cJSON *object,const char *string) {cJSON_Delete(cJSON_DetachItemFromObject(object,string));}
+void cJSON_AddItemToObject(cJSON * object, const char * string, cJSON * item) {
+	if(object->type != cJSON_Object)
+		return;
+	if(!item)
+		return;
+	if(item->string)
+		cJSON_free(item->string);
+	item->string = cJSON_strdup(string);
+	object->count++;
+	tree_insert_item(item, object);
+}
+void cJSON_AddItemReferenceToArray(cJSON *array, cJSON *item)						{cJSON_AddItemToArray(array,create_reference(item));}
+void cJSON_AddItemReferenceToObject(cJSON *object,const char *string,cJSON *item)	{cJSON_AddItemToObject(object,string,create_reference(item));}
+
+cJSON * cJSON_DetachItemFromArray(cJSON * array, int which) {
+	cJSON * parent;
+	int isleft;
+	cJSON * item = tree_lookup(NULL, which, array, &parent, &isleft); 
+	if(!item)
+		return NULL;
+	tree_remove(item, array);
+	return item;
+}
+
+void cJSON_DeleteItemFromArray(cJSON *array,int which) {cJSON_Delete(cJSON_DetachItemFromArray(array,which));}
+
+cJSON *cJSON_DetachItemFromObject(cJSON *object,const char *string) {
+	cJSON * parent;
+	int isleft;
+	cJSON * item = tree_lookup(string, 0, object, &parent, &isleft); 
+	if(!item)
+		return NULL;
+	tree_remove(item, object);
+	object->count--;
+	return item;
+}
+void cJSON_DeleteItemFromObject(cJSON *object,const char *string) {cJSON_Delete(cJSON_DetachItemFromObject(object,string));}
+
+void tree_replace(cJSON * obj, int index, const char * string, cJSON * newitem) {
+	cJSON * item, *parent;
+	int isleft;
+
+	item = tree_lookup(string, index, obj, &parent, &isleft);
+	if(!item)
+		return;
+
+	if(parent)
+		set_child(parent, newitem, isleft);
+	if(item->left)
+		set_parent(newitem, item->left);
+	if(item->right)
+		set_parent(newitem, item->right);
+
+	if(obj->first == item)
+		obj->first = newitem;
+	if(obj->last == item)
+		obj->last = newitem;
+	cJSON_Delete(item);
+}
 
 /* Replace array/object items with new ones. */
-void   cJSON_ReplaceItemInArray(cJSON *array,int which,cJSON *newitem)		{cJSON *c=array->child;while (c && which>0) c=c->next,which--;if (!c) return;
-	newitem->next=c->next;newitem->prev=c->prev;if (newitem->next) newitem->next->prev=newitem;
-	if (c==array->child) array->child=newitem; else newitem->prev->next=newitem;c->next=c->prev=0;cJSON_Delete(c);}
-void   cJSON_ReplaceItemInObject(cJSON *object,const char *string,cJSON *newitem){int i=0;cJSON *c=object->child;while(c && cJSON_strcasecmp(c->string,string))i++,c=c->next;if(c){newitem->string=cJSON_strdup(string);cJSON_ReplaceItemInArray(object,i,newitem);}}
-
+void   cJSON_ReplaceItemInArray(cJSON *array,int which,cJSON *newitem)
+{
+	tree_replace(array, which, NULL, newitem);
+}
+void cJSON_ReplaceItemInObject(cJSON * object, const char * string,
+	cJSON * newitem)
+{
+	tree_replace(object, 0, string, newitem);
+}
 /* Create basic types: */
 cJSON *cJSON_CreateNull()						{cJSON *item=cJSON_New_Item();if(item)item->type=cJSON_NULL;return item;}
 cJSON *cJSON_CreateTrue()						{cJSON *item=cJSON_New_Item();if(item)item->type=cJSON_True;return item;}
@@ -530,7 +994,55 @@ cJSON *cJSON_CreateArray()						{cJSON *item=cJSON_New_Item();if(item)item->type
 cJSON *cJSON_CreateObject()						{cJSON *item=cJSON_New_Item();if(item)item->type=cJSON_Object;return item;}
 
 /* Create Arrays: */
-cJSON *cJSON_CreateIntArray(int *numbers,int count)				{int i;cJSON *n=0,*p=0,*a=cJSON_CreateArray();for(i=0;a && i<count;i++){n=cJSON_CreateNumber(numbers[i]);if(!i)a->child=n;else suffix_object(p,n);p=n;}return a;}
-cJSON *cJSON_CreateFloatArray(float *numbers,int count)			{int i;cJSON *n=0,*p=0,*a=cJSON_CreateArray();for(i=0;a && i<count;i++){n=cJSON_CreateNumber(numbers[i]);if(!i)a->child=n;else suffix_object(p,n);p=n;}return a;}
-cJSON *cJSON_CreateDoubleArray(double *numbers,int count)		{int i;cJSON *n=0,*p=0,*a=cJSON_CreateArray();for(i=0;a && i<count;i++){n=cJSON_CreateNumber(numbers[i]);if(!i)a->child=n;else suffix_object(p,n);p=n;}return a;}
-cJSON *cJSON_CreateStringArray(const char **strings,int count)	{int i;cJSON *n=0,*p=0,*a=cJSON_CreateArray();for(i=0;a && i<count;i++){n=cJSON_CreateString(strings[i]);if(!i)a->child=n;else suffix_object(p,n);p=n;}return a;}
+cJSON *cJSON_CreateIntArray(int *numbers,int count)	{
+	int i;
+	cJSON *n=NULL,*a=cJSON_CreateArray();
+	if(!a)
+		return NULL;
+	for(i=0; i<count; i++) {
+		n=cJSON_CreateNumber(numbers[i]);
+		n->index = i;
+		tree_insert_item(n, a);
+	}
+	a->count=count;
+	return a;
+}
+cJSON *cJSON_CreateFloatArray(float *numbers,int count) {
+	int i;
+	cJSON *n=0,*a=cJSON_CreateArray();
+	if(!a)
+		return NULL;
+	for(i=0;i<count;i++) {
+		n=cJSON_CreateNumber(numbers[i]);
+		n->index = i;
+		tree_insert_item(n, a);
+	}
+	a->count=count;
+	return a;
+}
+
+cJSON *cJSON_CreateDoubleArray(double *numbers,int count) {
+	int i;
+	cJSON *n=0,*a=cJSON_CreateArray();
+	if(!a)
+		return NULL;
+	for(i=0;i<count;i++) {
+		n=cJSON_CreateNumber(numbers[i]);
+		n->index = i;
+		tree_insert_item(n, a);		
+	}
+	a->count = count;
+	return a;
+}
+cJSON *cJSON_CreateStringArray(const char **strings,int count) {
+	int i;
+	cJSON *n=0,*a=cJSON_CreateArray();
+	if(!a)
+		return NULL;
+	for(i=0;i<count;i++) {
+		n=cJSON_CreateString(strings[i]);
+		n->index = i;
+		tree_insert_item(n, a);
+	}
+	return a;
+}

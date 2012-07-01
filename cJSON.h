@@ -1,5 +1,6 @@
 /*
   Copyright (c) 2009 Dave Gamble
+  Copyright (c) 2011 Jonathan Reams
  
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -41,17 +42,22 @@ extern "C"
 
 /* The cJSON structure: */
 typedef struct cJSON {
-	struct cJSON *next,*prev;	/* next/prev allow you to walk array/object chains. Alternatively, use GetArraySize/GetArrayItem/GetObjectItem */
-	struct cJSON *child;		/* An array or object item will have a child pointer pointing to a chain of the items in the array/object. */
+	struct cJSON * left, *right, *parent;
+	struct cJSON * root, *first, *last;
+	int isred, count;
 
 	int type;					/* The type of the item, as above. */
 
+	size_t vstrlen;
 	char *valuestring;			/* The item's string, if type==cJSON_String */
 	int valueint;				/* The item's number, if type==cJSON_Number */
 	double valuedouble;			/* The item's number, if type==cJSON_Number */
 
 	char *string;				/* The item's name string, if this item is the child of, or is in the list of subitems of an object. */
+	int index;
 } cJSON;
+
+
 
 typedef struct cJSON_Hooks {
       void *(*malloc_fn)(size_t sz);
@@ -78,6 +84,10 @@ extern int	  cJSON_GetArraySize(cJSON *array);
 extern cJSON *cJSON_GetArrayItem(cJSON *array,int item);
 /* Get item "string" from object. Case insensitive. */
 extern cJSON *cJSON_GetObjectItem(cJSON *object,const char *string);
+
+/* Iterates over the children of an object or array. */
+extern cJSON *cJSON_GetFirstChild(cJSON *object);
+extern cJSON *cJSON_GetNextChild(cJSON *object);
 
 /* For analysing failed parses. This returns a pointer to the parse error. You'll probably need to look a few chars back to make sense of it. Defined when cJSON_Parse() returns 0. 0 when cJSON_Parse() succeeds. */
 extern const char *cJSON_GetErrorPtr();
